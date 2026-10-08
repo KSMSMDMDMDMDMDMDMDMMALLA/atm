@@ -225,7 +225,7 @@ async function broadcastMessage(senderId, messageType, payload, senderInfo) {
 function doStart(ctx) {
   addParticipant(ctx.from);
   ctx.reply(
-    'Вы в списке участников. Отправляйте сообщения — они анонимно уйдут всем.',
+    '👋🏻 Добро пожаловать в ATM. Скорей отправляй сообщение в бота и все анонимно увидят твоё сообщение.',
     bottomKeyboard(ctx.from.id)
   );
 }
