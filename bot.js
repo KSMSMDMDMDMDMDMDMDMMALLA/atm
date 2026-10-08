@@ -1,4 +1,3 @@
-require('dotenv').config();
 const { Telegraf, Markup } = require('telegraf');
 const PQueue = require('p-queue').default;
 
@@ -13,7 +12,10 @@ const {
   getLastMessageTime,
   setLastMessageTime,
   isTagEnabled,
-  setTagEnabled
+  setTagEnabled,
+  getPunishment,
+  setPunishment,
+  clearPunishment
 } = require('./db');
 
 // ====== НАСТРОЙКИ ======
@@ -25,8 +27,6 @@ const bot = new Telegraf(process.env.BOT_TOKEN);
 const queue = new PQueue({ concurrency: 5, interval: 100, intervalCap: 5 });
 
 // ====== НИЖНЯЯ КЛАВИАТУРА ======
-// Текст на кнопках — человеческий. Эмодзи дают визуальный цвет.
-// Telegram НЕ поддерживает цвет фона у reply-кнопок.
 function bottomKeyboard(userId) {
   const tagOn = isTagEnabled(userId);
   const active = hasParticipant(userId);
@@ -48,6 +48,26 @@ function setRevealOn(on) {
   setSetting('reveal_to_admins', on ? '1' : '0');
 }
 
+// ====== УТИЛИТЫ ВРЕМЕНИ ======
+function parseDuration(str) {
+  if (!str) return null;
+  const s = String(str).trim().toLowerCase();
+  if (s === '0' || s === '-' || s === 'forever' || s === 'бес') return 0;
+
+  const m = s.match(/^(\d+)\s*([smhd])$/);
+  if (!m) return null;
+
+  const n = parseInt(m[1], 10);
+  const unit = m[2];
+  const mult = { s: 1000, m: 60_000, h: 3_600_000, d: 86_400_000 }[unit];
+  return Date.now() + n * mult;
+}
+
+function formatUntil(ts) {
+  if (ts === 0) return 'бессрочно';
+  return new Date(ts).toLocaleString('ru-RU');
+}
+
 // ====== АНТИСПАМ ======
 function checkCooldown(ctx) {
   if (ctx.from.id === ADMIN_ID) return true;
@@ -64,6 +84,74 @@ function checkCooldown(ctx) {
 
   setLastMessageTime(ctx.from.id, now);
   return true;
+}
+
+// ====== БАН / МУТ ======
+function checkPunishment(ctx) {
+  const p = getPunishment(ctx.from.id);
+  if (!p) return true;
+
+  if (p.type === 'ban') {
+    ctx.reply(
+      `Вы забанены до: ${formatUntil(p.until_ts)}` +
+      (p.reason ? `\nПричина: ${p.reason}` : '')
+    );
+    return false;
+  }
+  if (p.type === 'mute') {
+    ctx.reply(
+      `Вы в муте до: ${formatUntil(p.until_ts)}` +
+      (p.reason ? `\nПричина: ${p.reason}` : '')
+    );
+    return false;
+  }
+  return true;
+}
+
+function getTargetFromReply(ctx) {
+  if (ctx.message.reply_to_message && ctx.message.reply_to_message.from) {
+    return ctx.message.reply_to_message.from.id;
+  }
+  return null;
+}
+
+function parsePunishArgs(text) {
+  const parts = text.trim().split(/\s+/);
+  parts.shift(); // сама команда
+  const time = parts.shift();
+  const reason = parts.join(' ').trim();
+  return { time, reason };
+}
+
+async function applyPunishment(ctx, type) {
+  if (ctx.from.id !== ADMIN_ID) {
+    return ctx.reply('Команда доступна только администратору.');
+  }
+
+  const target = getTargetFromReply(ctx);
+  if (!target) {
+    return ctx.reply(
+      'Ответьте этой командой на сообщение пользователя в боте. ' +
+      'Например: ответьте на его сообщение и напишите /ban 10m спам'
+    );
+  }
+
+  const { time, reason } = parsePunishArgs(ctx.message.text);
+  const until = parseDuration(time);
+  if (until === null) {
+    return ctx.reply(
+      'Неверный формат времени. Используйте: 30s, 10m, 2h, 1d, 7d или 0 (бессрочно).'
+    );
+  }
+
+  setPunishment(target, type, until, reason);
+
+  const label = type === 'ban' ? 'забанен' : 'замучен';
+  ctx.reply(
+    `Пользователь ${target} ${label}.\n` +
+    `До: ${formatUntil(until)}\n` +
+    (reason ? `Причина: ${reason}` : '')
+  );
 }
 
 // ====== ЭХО С ТЕГОМ ======
@@ -88,6 +176,10 @@ async function broadcastMessage(senderId, messageType, payload, senderInfo) {
 
   for (const userId of listParticipants()) {
     if (userId === senderId) continue;
+
+    // Забаненные не получают рассылку
+    const p = getPunishment(userId);
+    if (p && p.type === 'ban') continue;
 
     tasks.push(async () => {
       try {
@@ -164,7 +256,6 @@ bot.start(doStart);
 bot.command('stop', doStop);
 bot.command('tag', doTag);
 
-// Ловим нажатия на нижние кнопки (это обычный текст сообщения)
 bot.hears(TAG_LABELS, doTag);
 bot.hears(ACTIVE_LABELS, (ctx) => {
   if (hasParticipant(ctx.from.id)) {
@@ -194,14 +285,29 @@ bot.command('view', (ctx) => {
   ctx.reply(`Отображение отправителей для админа: ${next ? 'ВКЛ' : 'ВЫКЛ'}`);
 });
 
+// ====== BAN / MUTE / UNBAN ======
+bot.command('ban', (ctx) => applyPunishment(ctx, 'ban'));
+bot.command('mute', (ctx) => applyPunishment(ctx, 'mute'));
+
+bot.command('unban', (ctx) => {
+  if (ctx.from.id !== ADMIN_ID) {
+    return ctx.reply('Команда доступна только администратору.');
+  }
+  const target = getTargetFromReply(ctx);
+  if (!target) {
+    return ctx.reply('Ответьте на сообщение пользователя в боте.');
+  }
+  clearPunishment(target);
+  ctx.reply(`С пользователя ${target} сняты все ограничения.`);
+});
+
 // ====== ОБРАБОТЧИКИ СООБЩЕНИЙ ======
-// ВАЖНО: bot.hears(TAG_LABELS) и bot.hears(ACTIVE_LABELS) зарегистрированы раньше,
-// поэтому текст "🟢 Показать ТЭГ" и т.п. не попадёт в bot.on('text').
 bot.on('text', async (ctx) => {
   if (!hasParticipant(ctx.from.id)) {
     return ctx.reply('Сначала отправьте /start.', bottomKeyboard(ctx.from.id));
   }
 
+  if (!checkPunishment(ctx)) return;
   if (!checkCooldown(ctx)) return;
 
   await ctx.reply(ctx.message.text, selfExtra(ctx));
@@ -221,6 +327,7 @@ bot.on('photo', async (ctx) => {
     return ctx.reply('Сначала отправьте /start.', bottomKeyboard(ctx.from.id));
   }
 
+  if (!checkPunishment(ctx)) return;
   if (!checkCooldown(ctx)) return;
 
   const photo = ctx.message.photo[ctx.message.photo.length - 1];
@@ -243,6 +350,7 @@ bot.on('voice', async (ctx) => {
     return ctx.reply('Сначала отправьте /start.', bottomKeyboard(ctx.from.id));
   }
 
+  if (!checkPunishment(ctx)) return;
   if (!checkCooldown(ctx)) return;
 
   await ctx.replyWithVoice(ctx.message.voice.file_id, selfExtra(ctx));
@@ -262,6 +370,7 @@ bot.on('video', async (ctx) => {
     return ctx.reply('Сначала отправьте /start.', bottomKeyboard(ctx.from.id));
   }
 
+  if (!checkPunishment(ctx)) return;
   if (!checkCooldown(ctx)) return;
 
   const caption = ctx.message.caption || undefined;
